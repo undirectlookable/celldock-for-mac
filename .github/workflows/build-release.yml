@@ -1,0 +1,100 @@
+name: Build & Release CellDock
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp (e.g. 0.4.0). Empty = use Resources/Info.plist.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write   # softprops/action-gh-release 需要
+
+jobs:
+  build:
+    name: Build macOS app
+    runs-on: macos-26   # arm64；源码用到 NSGlassEffectView（macOS 26 SDK），需 Xcode 26+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ThirdParty/vowifi-go/go.mod
+
+      # --- 自适应签名：有证书 secrets 则导入钥匙串并以 release 签名，否则 none（不签名） ---
+      # 需要的 secrets（可选，暂缺则自动走不签名构建）：
+      #   CELLDOCK_DEVELOPER_ID_CERT          —— Developer ID Application 证书+私钥 p12 的 base64
+      #   CELLDOCK_DEVELOPER_ID_CERT_PASSWORD —— p12 的导出密码
+      #
+      # 注意：`if:` 条件里不能直接引用 `secrets` 上下文，所以先用一个步骤探测
+      # 证书是否存在，把结果写进 steps 输出，供后续步骤用 `if:` 判断。
+      - name: Detect signing certificate
+        id: signing
+        env:
+          CERT_BASE64: ${{ secrets.CELLDOCK_DEVELOPER_ID_CERT }}
+        run: |
+          if [[ -n "$CERT_BASE64" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.available == 'true'
+        env:
+          CERT_BASE64: ${{ secrets.CELLDOCK_DEVELOPER_ID_CERT }}
+          CERT_PASSWORD: ${{ secrets.CELLDOCK_DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/celldock-build.keychain"
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          echo "$CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/celldock-cert.p12"
+          security import "$RUNNER_TEMP/celldock-cert.p12" -P "$CERT_PASSWORD" \
+            -t agg -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Build CellDock archive
+        env:
+          # 显式给版本号，阻止 build_app.sh 自动递增并回写 Resources/Info.plist
+          CELLDOCK_BUILD_VERSION: ${{ github.run_number }}
+        run: |
+          # 版本号：tag 推送去掉前导 v；手动触发用输入值；否则用 Info.plist 默认值
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            export CELLDOCK_VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            export CELLDOCK_VERSION="${{ inputs.version }}"
+          fi
+
+          if [[ -n "${KEYCHAIN:-}" ]]; then
+            export CELLDOCK_SIGNING_MODE="release"
+          else
+            export CELLDOCK_SIGNING_MODE="none"
+          fi
+
+          scripts/build_app.sh
+          ls -l outputs/
+
+      - name: Upload ZIP as artifact (all runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CellDock-${{ github.run_number }}
+          path: outputs/*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: outputs/*.zip
+          generate_release_notes: true

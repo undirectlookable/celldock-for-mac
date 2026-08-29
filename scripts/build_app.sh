@@ -31,43 +31,45 @@ fi
 }
 SIGNING_MODE="${CELLDOCK_SIGNING_MODE:-release}"
 case "$SIGNING_MODE" in
-  release|development|community) ;;
+  release|development|community|none) ;;
   *)
     print -u2 "Invalid CellDock signing mode: $SIGNING_MODE"
-    print -u2 "Use release, development, or community."
+    print -u2 "Use release, development, community, or none."
     exit 1
     ;;
 esac
-SIGN_IDENTITY="${CELLDOCK_CODESIGN_IDENTITY:-${MAVO_CODESIGN_IDENTITY:-}}"
-if [[ -z "$SIGN_IDENTITY" && "$SIGNING_MODE" != community ]]; then
-  SIGN_IDENTITY="$(
-  security find-identity -v -p codesigning |
-    awk -F'"' -v mode="$SIGNING_MODE" '
-      mode == "release" && /"Developer ID Application:/ { print $2; exit }
-      mode == "development" && /"Apple Development:/ { print $2; exit }
-    '
-  )"
-fi
-[[ -n "$SIGN_IDENTITY" ]] || {
-  print -u2 "No compatible $SIGNING_MODE signing identity is available."
-  if [[ "$SIGNING_MODE" == community ]]; then
-    print -u2 "Community archives require CELLDOCK_CODESIGN_IDENTITY."
-  else
-    print -u2 "Set CELLDOCK_CODESIGN_IDENTITY to a stable code-signing identity."
+if [[ "$SIGNING_MODE" != none ]]; then
+  SIGN_IDENTITY="${CELLDOCK_CODESIGN_IDENTITY:-${MAVO_CODESIGN_IDENTITY:-}}"
+  if [[ -z "$SIGN_IDENTITY" && "$SIGNING_MODE" != community ]]; then
+    SIGN_IDENTITY="$(
+    security find-identity -v -p codesigning |
+      awk -F'"' -v mode="$SIGNING_MODE" '
+        mode == "release" && /"Developer ID Application:/ { print $2; exit }
+        mode == "development" && /"Apple Development:/ { print $2; exit }
+      '
+    )"
   fi
-  exit 1
-}
-SIGN_IDENTITY_RECORD="$({ security find-identity -v -p codesigning || true; } | grep -F "$SIGN_IDENTITY" | head -n 1 || true)"
-[[ -n "$SIGN_IDENTITY_RECORD" && "$SIGN_IDENTITY" != "-" ]] || {
-  print -u2 "CellDock archives require a certificate-backed code-signing identity."
-  print -u2 "Ad-hoc signing is not allowed because it breaks signer pinning and Keychain continuity."
-  exit 1
-}
-SIGN_CERT_SHA1="$(print -r -- "$SIGN_IDENTITY_RECORD" | awk '{ print $2; exit }')"
-[[ ${#SIGN_CERT_SHA1} -eq 40 && "$SIGN_CERT_SHA1" != *[^[:xdigit:]]* ]] || {
-  print -u2 "Could not resolve the signing certificate SHA-1 fingerprint."
-  exit 1
-}
+  [[ -n "$SIGN_IDENTITY" ]] || {
+    print -u2 "No compatible $SIGNING_MODE signing identity is available."
+    if [[ "$SIGNING_MODE" == community ]]; then
+      print -u2 "Community archives require CELLDOCK_CODESIGN_IDENTITY."
+    else
+      print -u2 "Set CELLDOCK_CODESIGN_IDENTITY to a stable code-signing identity."
+    fi
+    exit 1
+  }
+  SIGN_IDENTITY_RECORD="$({ security find-identity -v -p codesigning || true; } | grep -F "$SIGN_IDENTITY" | head -n 1 || true)"
+  [[ -n "$SIGN_IDENTITY_RECORD" && "$SIGN_IDENTITY" != "-" ]] || {
+    print -u2 "CellDock archives require a certificate-backed code-signing identity."
+    print -u2 "Ad-hoc signing is not allowed because it breaks signer pinning and Keychain continuity."
+    exit 1
+  }
+  SIGN_CERT_SHA1="$(print -r -- "$SIGN_IDENTITY_RECORD" | awk '{ print $2; exit }')"
+  [[ ${#SIGN_CERT_SHA1} -eq 40 && "$SIGN_CERT_SHA1" != *[^[:xdigit:]]* ]] || {
+    print -u2 "Could not resolve the signing certificate SHA-1 fingerprint."
+    exit 1
+  }
+fi
 APP_REQUIREMENT_OPTIONS=()
 HELPER_REQUIREMENT_OPTIONS=()
 if [[ "$SIGNING_MODE" == release ]]; then
@@ -85,7 +87,7 @@ elif [[ "$SIGNING_MODE" == development ]]; then
   }
   ARCHIVE_SUFFIX="-development"
   CODESIGN_OPTIONS=(--timestamp=none)
-else
+elif [[ "$SIGNING_MODE" == community ]]; then
   ARCHIVE_SUFFIX="-community-unnotarized"
   CODESIGN_OPTIONS=(--options runtime --timestamp=none)
   APP_REQUIREMENT_OPTIONS=(
@@ -96,6 +98,9 @@ else
     --requirements
     "=designated => identifier \"app.celldock.mac.network.helper\" and certificate leaf = H\"$SIGN_CERT_SHA1\""
   )
+else
+  ARCHIVE_SUFFIX="-unsigned"
+  CODESIGN_OPTIONS=()
 fi
 OUTPUT_DIR="$ROOT/outputs"
 APP="$OUTPUT_DIR/CellDock.app"
@@ -184,70 +189,72 @@ ditto "$SPARKLE_FRAMEWORK_SOURCE" "$STAGE_APP/$SPARKLE_FRAMEWORK_RELATIVE"
 xattr -cr "$STAGE_APP"
 SPARKLE_FRAMEWORK="$STAGE_APP/$SPARKLE_FRAMEWORK_RELATIVE"
 SPARKLE_VERSION="$SPARKLE_FRAMEWORK/Versions/B"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  --identifier app.celldock.mac.vowifi.runtime \
-  "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  "$SPARKLE_VERSION/XPCServices/Installer.xpc"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  --preserve-metadata=entitlements \
-  "$SPARKLE_VERSION/XPCServices/Downloader.xpc"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  "$SPARKLE_VERSION/Autoupdate"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  "$SPARKLE_VERSION/Updater.app"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  "$SPARKLE_FRAMEWORK"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  "${HELPER_REQUIREMENT_OPTIONS[@]}" \
-  --identifier app.celldock.mac.network.helper \
-  "$STAGE_APP/$HELPER_RELATIVE"
-codesign \
-  --force \
-  --sign "$SIGN_IDENTITY" \
-  "${CODESIGN_OPTIONS[@]}" \
-  "${APP_REQUIREMENT_OPTIONS[@]}" \
-  --identifier app.celldock.mac \
-  "$STAGE_APP"
-codesign --verify --deep --strict --verbose=2 "$STAGE_APP"
-
-for signed_code in \
-  "$SPARKLE_VERSION/XPCServices/Installer.xpc" \
-  "$SPARKLE_VERSION/XPCServices/Downloader.xpc" \
-  "$SPARKLE_VERSION/Autoupdate" \
-  "$SPARKLE_VERSION/Updater.app" \
-  "$SPARKLE_FRAMEWORK" \
-  "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE" \
-  "$STAGE_APP/$HELPER_RELATIVE" \
-  "$STAGE_APP"; do
+if [[ "$SIGNING_MODE" != none ]]; then
   codesign \
-    --verify \
-    --strict \
-    --verbose=2 \
-    --test-requirement "=certificate leaf = H\"$SIGN_CERT_SHA1\"" \
-    "$signed_code"
-done
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    --identifier app.celldock.mac.vowifi.runtime \
+    "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE"
+  codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    "$SPARKLE_VERSION/XPCServices/Installer.xpc"
+  codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    --preserve-metadata=entitlements \
+    "$SPARKLE_VERSION/XPCServices/Downloader.xpc"
+  codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    "$SPARKLE_VERSION/Autoupdate"
+  codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    "$SPARKLE_VERSION/Updater.app"
+  codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    "$SPARKLE_FRAMEWORK"
+  codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    "${HELPER_REQUIREMENT_OPTIONS[@]}" \
+    --identifier app.celldock.mac.network.helper \
+    "$STAGE_APP/$HELPER_RELATIVE"
+  codesign \
+    --force \
+    --sign "$SIGN_IDENTITY" \
+    "${CODESIGN_OPTIONS[@]}" \
+    "${APP_REQUIREMENT_OPTIONS[@]}" \
+    --identifier app.celldock.mac \
+    "$STAGE_APP"
+  codesign --verify --deep --strict --verbose=2 "$STAGE_APP"
+
+  for signed_code in \
+    "$SPARKLE_VERSION/XPCServices/Installer.xpc" \
+    "$SPARKLE_VERSION/XPCServices/Downloader.xpc" \
+    "$SPARKLE_VERSION/Autoupdate" \
+    "$SPARKLE_VERSION/Updater.app" \
+    "$SPARKLE_FRAMEWORK" \
+    "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE" \
+    "$STAGE_APP/$HELPER_RELATIVE" \
+    "$STAGE_APP"; do
+    codesign \
+      --verify \
+      --strict \
+      --verbose=2 \
+      --test-requirement "=certificate leaf = H\"$SIGN_CERT_SHA1\"" \
+      "$signed_code"
+  done
+fi
 if [[ "$SIGNING_MODE" == development && -d /Applications/CellDock.app ]]; then
   EXISTING_TEAM_ID="$(codesign -dvv /Applications/CellDock.app 2>&1 | awk -F= '$1 == "TeamIdentifier" && !found { print $2; found=1 }')"
   SIGNED_TEAM_ID="$(codesign -dvv "$STAGE_APP" 2>&1 | awk -F= '$1 == "TeamIdentifier" && !found { print $2; found=1 }')"
@@ -267,11 +274,13 @@ VERIFY_HELPER="$VERIFY_APP/$HELPER_RELATIVE"
 VERIFY_VOWIFI_RUNTIME="$VERIFY_APP/$VOWIFI_RUNTIME_RELATIVE"
 VERIFY_PLIST="$VERIFY_APP/$PLIST_RELATIVE"
 VERIFY_SPARKLE="$VERIFY_APP/$SPARKLE_FRAMEWORK_RELATIVE"
-codesign --verify --deep --strict --verbose=2 "$VERIFY_APP"
-codesign --verify --strict --verbose=2 "$VERIFY_HELPER"
-codesign --verify --strict --verbose=2 "$VERIFY_VOWIFI_RUNTIME"
-codesign --verify --deep --strict --verbose=2 "$VERIFY_SPARKLE"
-if [[ "$SIGNING_MODE" != development ]]; then
+if [[ "$SIGNING_MODE" != none ]]; then
+  codesign --verify --deep --strict --verbose=2 "$VERIFY_APP"
+  codesign --verify --strict --verbose=2 "$VERIFY_HELPER"
+  codesign --verify --strict --verbose=2 "$VERIFY_VOWIFI_RUNTIME"
+  codesign --verify --deep --strict --verbose=2 "$VERIFY_SPARKLE"
+fi
+if [[ "$SIGNING_MODE" != development && "$SIGNING_MODE" != none ]]; then
   for hardened_code in "$VERIFY_APP" "$VERIFY_HELPER" "$VERIFY_VOWIFI_RUNTIME"; do
     HARDENED_SIGNING_INFO="$(codesign -dvv "$hardened_code" 2>&1)"
     [[ "$HARDENED_SIGNING_INFO" == *flags=*runtime* ]] || {
@@ -393,14 +402,16 @@ VERIFY_VOWIFI_ARCHS=" $(lipo -archs "$VERIFY_VOWIFI_RUNTIME") "
   print -u2 "Archive helper minOS is not 14.0."
   exit 1
 }
-[[ "$(codesign -dvv "$VERIFY_BINARY" 2>&1 | awk -F= '$1 == "Identifier" { print $2; exit }')" == "app.celldock.mac" ]] || {
-  print -u2 "Archive executable signing identifier is incorrect."
-  exit 1
-}
-[[ "$(codesign -dvv "$VERIFY_HELPER" 2>&1 | awk -F= '$1 == "Identifier" { print $2; exit }')" == "app.celldock.mac.network.helper" ]] || {
-  print -u2 "Archive helper signing identifier is incorrect."
-  exit 1
-}
+if [[ "$SIGNING_MODE" != none ]]; then
+  [[ "$(codesign -dvv "$VERIFY_BINARY" 2>&1 | awk -F= '$1 == "Identifier" { print $2; exit }')" == "app.celldock.mac" ]] || {
+    print -u2 "Archive executable signing identifier is incorrect."
+    exit 1
+  }
+  [[ "$(codesign -dvv "$VERIFY_HELPER" 2>&1 | awk -F= '$1 == "Identifier" { print $2; exit }')" == "app.celldock.mac.network.helper" ]] || {
+    print -u2 "Archive helper signing identifier is incorrect."
+    exit 1
+  }
+fi
 [[ "$(plutil -extract Label raw "$VERIFY_PLIST")" == "app.celldock.mac.network.helper" ]] || {
   print -u2 "LaunchDaemon label is incorrect."
   exit 1
